@@ -44,23 +44,29 @@ static int parity8( int value )
  */
 int readPacket( void )
 {
-	int word = 0;
-	int i = 0;
-	int low = 0;
-	int half = 0;
+	int word  = 0;  /* the received word, for return to the caller */
+	int i     = 0;  /* loop variable */
+	int low   = 0;  /* time spent low within one frame (bit) */
+	int high  = 0;  /* time spent high within one frame (bit) */
+	int half  = 0;  /* time for half one frame */
+	int frame = 0;  /* time for one frame */
 	
 	/* wait for the line to go low */
 	while ( gpio_get_value(tempGPIO) );
 	
 	/* time the low portion of the start bit, which is half the duty cycle */
 	while ( !gpio_get_value(tempGPIO) ) ++half;
+	
+	/* duration of a complete frame (usually around 125us) */
+	frame = 2*half;
 
     /* read the remaining 9 bits: data and parity */
 	for (i=0; i<9; ++i) {
-	    low = 0;
+	    low  = 0;
+	    high = 0;
 	    
 	    /* wait for the line to go low */
-		while ( gpio_get_value(tempGPIO) );	
+		while ( gpio_get_value(tempGPIO) ) ++high;	
 
 	    /* time how long the line is low */
 		while ( !gpio_get_value(tempGPIO) ) ++low;
@@ -70,6 +76,9 @@ int readPacket( void )
 		 */
 		word <<= 1;		
 		if ( low < half ) word |= 1;
+		
+		/* if the line is high for more than one frame, something is wrong */
+		if ( high > frame ) return -1;
 	}
 
     /* return the result */
@@ -101,10 +110,14 @@ int readTemperature( void )
 
 	/* read two packets: this is time critical */
 	packet0 = readPacket();
-	packet1 = readPacket();
+	if ( packet0 >= 0 )
+	    packet1 = readPacket();
 	
-	/* printk( KERN_ALERT "tsic %X %X\n", packet0, packet1 ); */
-
+	if ( (packet0 < 0) || (packet1 < 0) ) {
+	    /*printk( KERN_ALERT "tsic: protocol error\n" );*/
+	    return INVALID_TEMP;
+	}
+	
 	/* strip off the parity bit */
 	parity0 = packet0 & 1;
 	packet0 >>= 1;
@@ -117,7 +130,16 @@ int readTemperature( void )
 		( parity1 == parity8(packet1) );
 	
 	/* if the parity is wrong, return INVALID_TEMP */
-	if ( !valid ) return INVALID_TEMP;
+	if ( !valid ) {
+    	/*printk( KERN_ALERT "tsic: parity error (%03X %03X)\n", packet0, packet1 );*/
+	    return INVALID_TEMP;
+	}
+	
+	/* if any of the top 5 bits of packet 0 are high, that's an error */
+	if ( (packet0 & 0xF8) != 0 ) {
+	    /*printk( KERN_ALERT "tsic: prefix error (%03X %03X)\n", packet0, packet1 );*/
+	    return INVALID_TEMP;
+	}
 
 	/* this is our raw 8 bit word */
 	raw = (packet0 << 8) | packet1;
@@ -128,9 +150,11 @@ int readTemperature( void )
 	/* check that the temperature lies in the measurable range */
 	if ( (temp >= minTemp) && (temp <= maxTemp) ) {
 		/* all looks good */
+		/*printk( KERN_ALERT "tsic: looks good (%03X %03X %d)\n", packet0, packet1, temp );*/
 		return temp;
 	} else {
 		/* parity looked good, but the value is out of the valid range */
+		/*printk( KERN_ALERT "tsic: range error (%03X %03X)\n", packet0, packet1 );*/
 		return INVALID_TEMP;
 	}
 }
