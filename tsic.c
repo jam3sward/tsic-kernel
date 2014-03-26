@@ -41,24 +41,41 @@ static int parity8( int value )
 
 /*---------------------------------------------------------------------------*/
 
-/* Reads a 10 bit packet: 1 start bit, 8 data bits and 1 parity bit */
+/* Reads a 10 bit packet: 1 start bit, 8 data bits and 1 parity bit.
+ * Only 9 bits are returned, consisting of the data bits and even parity bit
+ * in bit 0 (the start bit is omitted).
+ */
 int readPacket( void )
 {
 	int word = 0;
 	int i = 0;
-	int lo = 0;
-	int hi = 0;
+	int low = 0;
+	int half = 0;
+	
+	/* wait for the line to go low */
+	while ( gpio_get_value(tempGPIO) );
+	
+	/* time the low portion of the start bit, which is half the duty cycle */
+	while ( !gpio_get_value(tempGPIO) ) ++half;
 
-	for (i=0; i<10; ++i) {
-	    lo = 0;
-	    hi = 0;
-		while ( !gpio_get_value(tempGPIO) ) ++lo;
-		while (  gpio_get_value(tempGPIO) ) ++hi;
+    /* read the remaining 9 bits: data and parity */
+	for (i=0; i<9; ++i) {
+	    low = 0;
+	    
+	    /* wait for the line to go low */
+		while ( gpio_get_value(tempGPIO) );	
 
-		if ( hi > lo ) word |= 1;
-		word <<= 1;
+	    /* time how long the line is low */
+		while ( !gpio_get_value(tempGPIO) ) ++low;
+		
+		/* if the line is low for less than half the duty cycle, this must
+		 * be a high bit, which we store
+		 */
+		word <<= 1;		
+		if ( low < half ) word |= 1;
 	}
 
+    /* return the result */
 	return word;
 }
 
@@ -75,20 +92,21 @@ int readTemperature( void )
     int raw = 0;
     int temp = 0;
     
-	// lower and upper limits of temperature range
-	const int minTemp = -50;
-	const int maxTemp = 150;
-    
+	/* scale factor for reporting values: this avoids the need for floating
+	 * point maths inside the kernel module, and is consistent with the scale
+	 * factor used for other temperature sensors (such as thermal_zone0)
+	 */
+	const int scale = 1000;
+	
+	/* lower and upper limits of temperature range */
+	const int minTemp = -50 * scale;
+	const int maxTemp = 150 * scale;
+
 	/* read two packets: this is time critical */
-	while ( gpio_get_value(tempGPIO) );
 	packet0 = readPacket();
 	packet1 = readPacket();
 	
-	printk( KERN_ALERT "tsic %X %X\n", packet0, packet1 );
-
-	/* strip off the start bit */
-	packet0 &= 0x1FF;
-	packet1 &= 0x1FF;
+	/* printk( KERN_ALERT "tsic %X %X\n", packet0, packet1 ); */
 
 	/* strip off the parity bit */
 	parity0 = packet0 & 1;
@@ -98,22 +116,20 @@ int readTemperature( void )
 	
 	/* check the parity on both bytes */
 	valid =
-		( parity0 != parity8(packet0) ) &&
-		( parity1 != parity8(packet1) );
-		
-	//printk( KERN_ALERT "%d %d %d %d\n", parity0, parity8(packet0), parity1, parity8(packet1) );
+		( parity0 == parity8(packet0) ) &&
+		( parity1 == parity8(packet1) );
 	
 	/* if the parity is wrong, return INVALID_TEMP */
-	//if ( !valid ) return INVALID_TEMP;
+	if ( !valid ) return INVALID_TEMP;
 
 	/* this is our raw 8 bit word */
 	raw = (packet0 << 8) | packet1;
 
 	/* convert raw integer to temperature in degrees C */
-	temp = (maxTemp - minTemp) * 1000 * raw / 2047 + minTemp;
+	temp = (maxTemp - minTemp) * raw / 2047 + minTemp;
 
 	/* check that the temperature lies in the measurable range */
-	if ( (temp >= minTemp*1000) && (temp <= maxTemp*1000) ) {
+	if ( (temp >= minTemp) && (temp <= maxTemp) ) {
 		/* all looks good */
 		return temp;
 	} else {
@@ -131,9 +147,16 @@ static ssize_t temp_show(
 	char *buffer
 ) {
     if ( s_initGPIO ) {
-        return sprintf( buffer, "%d\n", readTemperature() );
+        /* read the temperature sensor */
+        int temperature = readTemperature();
+        
+        /* output the temperature if valid */
+        if ( temperature != INVALID_TEMP )
+            return sprintf( buffer, "%d\n", temperature );
+        else
+            return 0;
     } else
-        return sprintf( buffer, "0\n" );
+        return 0;
 }
 
 /*---------------------------------------------------------------------------*/
