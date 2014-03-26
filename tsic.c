@@ -27,9 +27,6 @@ static const int tempGPIO = 4;
 /* Represents invalid temperature reading */
 static const int INVALID_TEMP = -100000;
 
-/* Has the GPIO been successfully initialised? */
-static int s_initGPIO = 0;
-
 /*---------------------------------------------------------------------------*/
 
 /* calculate parity for an eight bit value */
@@ -146,16 +143,13 @@ static ssize_t temp_show(
     struct kobj_attribute *attribute,
 	char *buffer
 ) {
-    if ( s_initGPIO ) {
-        /* read the temperature sensor */
-        int temperature = readTemperature();
-        
-        /* output the temperature if valid */
-        if ( temperature != INVALID_TEMP )
-            return sprintf( buffer, "%d\n", temperature );
-        else
-            return 0;
-    } else
+    /* read the temperature sensor */
+    int temperature = readTemperature();
+    
+    /* output the temperature if valid */
+    if ( temperature != INVALID_TEMP )
+        return sprintf( buffer, "%d\n", temperature );
+    else
         return 0;
 }
 
@@ -214,9 +208,6 @@ static int gpioInit( void )
         return -EINVAL;
     }
     
-    /* GPIO is initialised */
-    s_initGPIO = 1;
-    
     return 0;
 }
 
@@ -226,7 +217,6 @@ static int gpioInit( void )
 static void gpioFree( void )
 {
     gpio_free(tempGPIO);
-    s_initGPIO = 0;
 }
 
 /*---------------------------------------------------------------------------*/
