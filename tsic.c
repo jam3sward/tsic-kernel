@@ -141,7 +141,7 @@ int readTemperature( void )
 	    return INVALID_TEMP;
 	}
 
-	/* this is our raw 8 bit word */
+	/* this is our raw 11 bit word */
 	raw = (packet0 << 8) | packet1;
 
 	/* convert raw integer to temperature in degrees C */
