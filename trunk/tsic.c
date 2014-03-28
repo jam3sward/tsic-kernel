@@ -24,6 +24,16 @@ static struct kobject *s_kernelObject = NULL;
 /* GPIO pin used for temperature sensor */
 static const int tempGPIO = 4;
 
+/* Scale factor for reporting values: this avoids the need for floating
+ * point maths inside the kernel module, and is consistent with the scale
+ * factor used for other temperature sensors (such as thermal_zone0)
+ */
+static const int SCALE_FACTOR = 1000;
+
+/* The lower and upper limits of temperature range for the TSIC 306 */
+static const int MIN_TEMP = -50;
+static const int MAX_TEMP = 150;
+
 /* Represents invalid temperature reading */
 static const int INVALID_TEMP = -100000;
 
@@ -133,16 +143,6 @@ int readTemperature( void )
     int valid = 0;
     int raw = 0;
     int temp = 0;
-    
-	/* scale factor for reporting values: this avoids the need for floating
-	 * point maths inside the kernel module, and is consistent with the scale
-	 * factor used for other temperature sensors (such as thermal_zone0)
-	 */
-	const int scale = 1000;
-	
-	/* lower and upper limits of temperature range */
-	const int minTemp = -50 * scale;
-	const int maxTemp = 150 * scale;
 
 	/* read packets from the sensor: this is time critical */
 	raw = readPacket();
@@ -181,10 +181,10 @@ int readTemperature( void )
 	raw = (packet0 << 8) | packet1;
 
 	/* convert raw integer to temperature in degrees C */
-	temp = (maxTemp - minTemp) * raw / 2047 + minTemp;
+	temp = (MAX_TEMP - MIN_TEMP) * SCALE_FACTOR * raw / 2047 + MIN_TEMP * SCALE_FACTOR;
 
 	/* check that the temperature lies in the measurable range */
-	if ( (temp >= minTemp) && (temp <= maxTemp) ) {
+	if ( (temp >= MIN_TEMP * SCALE_FACTOR) && (temp <= MAX_TEMP * SCALE_FACTOR) ) {
 		/* all looks good */
 		/*printk( KERN_ALERT "tsic: looks good (%03X %03X %d)\n", packet0, packet1, temp );*/
 		return temp;
