@@ -15,6 +15,7 @@
 #include <linux/gpio.h>
 #include <linux/time.h>
 #include <linux/delay.h>
+#include <linux/sched.h>
 
 /*---------------------------------------------------------------------------*/
 
@@ -37,6 +38,9 @@ static const int MAX_TEMP = 150;
 /* Represents invalid temperature reading */
 static const int INVALID_TEMP = -100000;
 
+/* Watchdog timeout period in ms */
+static const int WATCHDOG_TIMEOUT = 250;
+
 /*---------------------------------------------------------------------------*/
 
 /* calculate parity for an eight bit value */
@@ -44,6 +48,18 @@ static int parity8( int value )
 {
 	value = (value ^ (value >> 4)) & 0x0F;
 	return (0x6996 >> value) & 1;
+}
+
+/*---------------------------------------------------------------------------*/
+
+/* This flag is set by the watchdog when the time expires */
+static int watchdog = 0;
+
+/* This callback is fired when the time expires, and sets the watchdog flag */
+void watchdogCallback( unsigned long data )
+{
+    watchdog = 1;
+    printk( KERN_ALERT "tsic: timeout watchdog fired\n" );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -61,6 +77,17 @@ int readPacket( void )
 	int half  = 0;  /* time for half one frame */
 	int frame = 0;  /* time for one frame */
 	int retry = 0;  /* count number of retries */
+	int fail  = 0;  /* flag indicates failure */
+    
+    /* Schedule our watchdog timer. When this fires it sets the 'watchdog'
+     * flag. The loops below which read the GPIO state also test this flag, so
+     * that they will exit when a timeout occurs.
+     * Without this, a hardware fault could potentially cause an infinite loop.
+     */
+    static struct timer_list watchdogTimer;
+    watchdog = 0;
+    setup_timer( &watchdogTimer, watchdogCallback, 0 );
+    mod_timer( &watchdogTimer, jiffies + msecs_to_jiffies(WATCHDOG_TIMEOUT) );
 
     /* There's a transmission lasting about 2.6ms every 100ms, and we could
      * be anywhere in that cycle when we enter this function. There's a
@@ -69,10 +96,15 @@ int readPacket( void )
      */
     for (;;) {
 	    /* wait for the line to go low */
-	    while ( gpio_get_value(tempGPIO) ) ++high;
-	
+	    while ( gpio_get_value(tempGPIO) && !watchdog ) ++high;
+
 	    /* time the low portion of the start bit, which is half the duty cycle */
-	    while ( !gpio_get_value(tempGPIO) ) ++half;
+	    while ( !gpio_get_value(tempGPIO) && !watchdog ) ++half;
+	    
+	    if ( watchdog ) {
+	        ++fail;
+	        break;
+	    }
 	    	
 	    /* duration of a complete frame (usually around 125us) */
 	    frame = 2*half;
@@ -83,7 +115,10 @@ int readPacket( void )
 	     */
 	    if ( high < 2*frame ) {
 	        /* have we exceeded the maximum number of retries? */
-	        if ( ++retry > 1 ) return -1;
+	        if ( ++retry > 1 ) {
+	            ++fail;
+	            break;
+	        }
 	        
 	        /* updates are every 100ms and last around 2.6ms, we want to delay
 	         * until just before the next update. this could sleep for longer.
@@ -96,29 +131,44 @@ int readPacket( void )
     }
 
     /* read the remaining 19 bits */
-	for (i=0; i<19; ++i) {
-	    low  = 0;
-	    high = 0;
-	    
-	    /* wait for the line to go low */
-		while ( gpio_get_value(tempGPIO) ) ++high;	
+	for (i=0; (i<19) && !fail; ++i) {
+        low  = 0;
+        high = 0;
+        
+        /* wait for the line to go low */
+	    while ( gpio_get_value(tempGPIO) && !watchdog ) ++high;	
 
-	    /* time how long the line is low */
-		while ( !gpio_get_value(tempGPIO) ) ++low;
-		
-		/* if the line is low for less than half the duty cycle, this must
-		 * be a high bit, which we store. because we only examine the
-		 * low pulses, this will ignore the stop bit between the two packets
-		 */	
-		if ( low < half ) word |= 1<<(18-i);
-		
-		/* if the line is high for more than 2 frames, something is wrong
-		 * note: it could legitimately be high for up to 1.75 frames if the
-	     * first packet ends with high parity (75% duty) followed by the 100%
-	     * duty stop bit between the two packets
-	     */
-		if ( high > 2*frame ) return -1;
-	}
+        /* time how long the line is low */
+	    while ( !gpio_get_value(tempGPIO) && !watchdog ) ++low;
+	
+	    /* if the watchdog fired, exit the loop */
+	    if ( watchdog ) {
+	        ++fail;
+	        break;
+	    }
+	
+	    /* if the line is low for less than half the duty cycle, this must
+	     * be a high bit, which we store. because we only examine the
+	     * low pulses, this will ignore the stop bit between the two packets
+	     */	
+	    if ( low < half ) word |= 1<<(18-i);
+	
+	    /* if the line is high for more than 2 frames, something is wrong
+	     * note: it could legitimately be high for up to 1.75 frames if the
+         * first packet ends with high parity (75% duty) followed by the 100%
+         * duty stop bit between the two packets
+         */
+	    if ( high > 2*frame ) {
+	        ++fail;
+	        break;
+	    }
+    }
+	
+	/* delete the watchdog timer */
+	del_timer( &watchdogTimer );
+	
+	/* in case of failure, return -1 to indicate an error */
+	if ( fail ) return -1;
 	
 	/* contains: <data><parity><start><data><parity> */
 	
