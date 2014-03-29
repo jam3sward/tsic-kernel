@@ -23,7 +23,8 @@
 static struct kobject *s_kernelObject = NULL;
 
 /* GPIO pin used for temperature sensor */
-static const int tempGPIO = 4;
+static int gpio = 4;
+module_param(gpio, int, S_IRUGO);
 
 /* Scale factor for reporting values: this avoids the need for floating
  * point maths inside the kernel module, and is consistent with the scale
@@ -96,10 +97,10 @@ int readPacket( void )
      */
     for (;;) {
 	    /* wait for the line to go low */
-	    while ( gpio_get_value(tempGPIO) && !watchdog ) ++high;
+	    while ( gpio_get_value(gpio) && !watchdog ) ++high;
 
 	    /* time the low portion of the start bit, which is half the duty cycle */
-	    while ( !gpio_get_value(tempGPIO) && !watchdog ) ++half;
+	    while ( !gpio_get_value(gpio) && !watchdog ) ++half;
 	    
 	    if ( watchdog ) {
 	        ++fail;
@@ -136,10 +137,10 @@ int readPacket( void )
         high = 0;
         
         /* wait for the line to go low */
-	    while ( gpio_get_value(tempGPIO) && !watchdog ) ++high;	
+	    while ( gpio_get_value(gpio) && !watchdog ) ++high;	
 
         /* time how long the line is low */
-	    while ( !gpio_get_value(tempGPIO) && !watchdog ) ++low;
+	    while ( !gpio_get_value(gpio) && !watchdog ) ++low;
 	
 	    /* if the watchdog fired, exit the loop */
 	    if ( watchdog ) {
@@ -305,20 +306,20 @@ static struct attribute_group attributeGroup = {
 static int gpioInit( void )
 {
     /* check that GPIO is valid */
-    if ( !gpio_is_valid(tempGPIO) ){
-        printk( KERN_ALERT "GPIO %d is not valid\n", tempGPIO );
+    if ( !gpio_is_valid(gpio) ){
+        printk( KERN_ALERT "GPIO %d is not valid\n", gpio );
         return -EINVAL;
     }
 
     /* request the GPIO pin */
-    if( gpio_request(tempGPIO, "tsic") != 0 ) {
-        printk( KERN_ALERT "Unable to request GPIO %d\n", tempGPIO );
+    if( gpio_request(gpio, "tsic") != 0 ) {
+        printk( KERN_ALERT "Unable to request GPIO %d\n", gpio );
         return -EINVAL;
     }
 
     /* make GPIO an input */
-    if( gpio_direction_input(tempGPIO) != 0 ) {
-        printk( KERN_ALERT "Failed to make GPIO %d an input\n", tempGPIO );
+    if( gpio_direction_input(gpio) != 0 ) {
+        printk( KERN_ALERT "Failed to make GPIO %d an input\n", gpio );
         return -EINVAL;
     }
     
@@ -330,7 +331,7 @@ static int gpioInit( void )
 /* Free GPIO */
 static void gpioFree( void )
 {
-    gpio_free(tempGPIO);
+    gpio_free(gpio);
 }
 
 /*---------------------------------------------------------------------------*/
