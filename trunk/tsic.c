@@ -13,9 +13,11 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/gpio.h>
+#include <linux/interrupt.h>
 #include <linux/time.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
+#include <linux/irq.h>
 
 /*---------------------------------------------------------------------------*/
 
@@ -65,6 +67,33 @@ void watchdogCallback( unsigned long data )
 
 /*---------------------------------------------------------------------------*/
 
+static int irqCount = 0;    /* Number of interrupts received */
+static int irqWord  = 0;    /* The data word, updated by interrupt handler */
+
+static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
+{
+    int value;
+    
+    /* Assuming that each bit frame is 125us duration, and logic 1 is 75%
+     * duty, and logic 0 is 25% duty, we sample between 31.25us and 93.75us.
+     * Here we use 40us, allowing for some tolerance in case of delay.
+     */
+    udelay(40);
+    
+    /* Sample the data line */
+    value = gpio_get_value(gpio) & 1;
+    
+    /* Store the data bit */
+    if (irqCount < 20) irqWord = (irqWord << 1) | value;
+    
+    /* Count the number of interrupts (bits) handled */
+    ++irqCount;
+    
+    return IRQ_HANDLED;
+}
+
+/*---------------------------------------------------------------------------*/
+
 /* Read two packets from the device, strips the start bit off each and returns
  * an 18 bit word consisting of two 9 bit values (data byte and even parity
  * bit in the least significant bit)
@@ -72,109 +101,54 @@ void watchdogCallback( unsigned long data )
 int readPacket( void )
 {
 	int word  = 0;  /* the received word, for return to the caller */
-	int i     = 0;  /* loop variable */
-	int low   = 0;  /* time spent low within one frame (bit) */
-	int high  = 0;  /* time spent high within one frame (bit) */
-	int half  = 0;  /* time for half one frame */
-	int frame = 0;  /* time for one frame */
-	int retry = 0;  /* count number of retries */
-	int fail  = 0;  /* flag indicates failure */
+    int irq   = 0;  /* the IRQ number */
+    
+	static struct timer_list watchdogTimer;
     
     /* Schedule our watchdog timer. When this fires it sets the 'watchdog'
      * flag. The loops below which read the GPIO state also test this flag, so
      * that they will exit when a timeout occurs.
      * Without this, a hardware fault could potentially cause an infinite loop.
      */
-    static struct timer_list watchdogTimer;
+
     watchdog = 0;
     setup_timer( &watchdogTimer, watchdogCallback, 0 );
     mod_timer( &watchdogTimer, jiffies + msecs_to_jiffies(WATCHDOG_TIMEOUT) );
 
-    /* There's a transmission lasting about 2.6ms every 100ms, and we could
-     * be anywhere in that cycle when we enter this function. There's a
-     * small chance (about 3%) that we could be inside a packet already.
-     * We try to detect the situation and retry if needed.
+    /* Request an IRQ for the sensor GPIO pin, so that we can detect falling
+     * edge of each transmitted bit. The interrupt handler will then sample
+     * and store each bit.
      */
-    for (;;) {
-	    /* wait for the line to go low */
-	    while ( gpio_get_value(gpio) && !watchdog ) ++high;
 
-	    /* time the low portion of the start bit, which is half the duty cycle */
-	    while ( !gpio_get_value(gpio) && !watchdog ) ++half;
-	    
-	    if ( watchdog ) {
-	        ++fail;
-	        break;
-	    }
-	    	
-	    /* duration of a complete frame (usually around 125us) */
-	    frame = 2*half;
-	
-	    /* if the line was high for less than two frames, then it looks as if
-	     * we started sampling part way through a packet (in fact, this very
-	     * rarely happens in practice)
-	     */
-	    if ( high < 2*frame ) {
-	        /* have we exceeded the maximum number of retries? */
-	        if ( ++retry > 1 ) {
-	            ++fail;
-	            break;
-	        }
-	        
-	        /* updates are every 100ms and last around 2.6ms, we want to delay
-	         * until just before the next update. this could sleep for longer.
-	         */
-	        msleep( 95 );
-	    } else {
-	        /* this looks like the start of a good packet */
-	        break;
-	    }
+    irq = gpio_to_irq( gpio );
+    irqCount = 0;
+    irqWord  = 0;
+    if ( request_irq(irq, gpioInterruptHandler, IRQF_TRIGGER_FALLING, "tsic_irq", NULL) ) {
+        del_timer( &watchdogTimer );
+        return -1;
     }
 
-    /* read the remaining 19 bits */
-	for (i=0; (i<19) && !fail; ++i) {
-        low  = 0;
-        high = 0;
-        
-        /* wait for the line to go low */
-	    while ( gpio_get_value(gpio) && !watchdog ) ++high;	
+    /* Wait until the interrupt handler has collected 20 bits, or the watchdog
+     * timer has expired.
+     */
 
-        /* time how long the line is low */
-	    while ( !gpio_get_value(gpio) && !watchdog ) ++low;
+    while ( (irqCount < 20) && !watchdog ) msleep(1);
+
+    /* Delete the watchdog timer */
+    del_timer( &watchdogTimer );
+    
+    /* Free the interrupt */
+	free_irq( irq, NULL );
 	
-	    /* if the watchdog fired, exit the loop */
-	    if ( watchdog ) {
-	        ++fail;
-	        break;
-	    }
-	
-	    /* if the line is low for less than half the duty cycle, this must
-	     * be a high bit, which we store. because we only examine the
-	     * low pulses, this will ignore the stop bit between the two packets
-	     */	
-	    if ( low < half ) word |= 1<<(18-i);
-	
-	    /* if the line is high for more than 2 frames, something is wrong
-	     * note: it could legitimately be high for up to 1.75 frames if the
-         * first packet ends with high parity (75% duty) followed by the 100%
-         * duty stop bit between the two packets
-         */
-	    if ( high > 2*frame ) {
-	        ++fail;
-	        break;
-	    }
-    }
-	
-	/* delete the watchdog timer */
-	del_timer( &watchdogTimer );
-	
-	/* in case of failure, return -1 to indicate an error */
-	if ( fail ) return -1;
+	/* Copy the data word from the interrupt handler */
+	word = irqWord;
 	
 	/* contains: <data><parity><start><data><parity> */
 	
 	/* strip out start bit in middle */
 	word = (word & 0x1FF) | ((word >> 1) & (0x1FF << 9));
+	
+    /*printk( KERN_ALERT "tsic: %X\n", word );*/
 
     /* now contains: <data><parity><data><parity> */
 
