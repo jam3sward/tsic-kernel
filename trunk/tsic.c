@@ -34,6 +34,9 @@ module_param(gpio, int, S_IRUGO);
  */
 static const int SCALE_FACTOR = 1000;
 
+/* The number of bits expected from the TSIC 306 */
+static const int TSIC_BITS = 20;
+
 /* The lower and upper limits of temperature range for the TSIC 306 */
 static const int MIN_TEMP = -50;
 static const int MAX_TEMP = 150;
@@ -42,7 +45,7 @@ static const int MAX_TEMP = 150;
 static const int INVALID_TEMP = -100000;
 
 /* Watchdog timeout period in ms */
-static const int WATCHDOG_TIMEOUT = 250;
+static const int WATCHDOG_TIMEOUT = 110;
 
 /*---------------------------------------------------------------------------*/
 
@@ -51,18 +54,6 @@ static int parity8( int value )
 {
 	value = (value ^ (value >> 4)) & 0x0F;
 	return (0x6996 >> value) & 1;
-}
-
-/*---------------------------------------------------------------------------*/
-
-/* This flag is set by the watchdog when the time expires */
-static int watchdog = 0;
-
-/* This callback is fired when the time expires, and sets the watchdog flag */
-void watchdogCallback( unsigned long data )
-{
-    watchdog = 1;
-    printk( KERN_ALERT "tsic: timeout watchdog fired\n" );
 }
 
 /*---------------------------------------------------------------------------*/
@@ -84,7 +75,7 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
     value = gpio_get_value(gpio) & 1;
     
     /* Store the data bit */
-    if (irqCount < 20) irqWord = (irqWord << 1) | value;
+    if (irqCount < TSIC_BITS) irqWord = (irqWord << 1) | value;
     
     /* Count the number of interrupts (bits) handled */
     ++irqCount;
@@ -96,49 +87,38 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 
 /* Read two packets from the device, strips the start bit off each and returns
  * an 18 bit word consisting of two 9 bit values (data byte and even parity
- * bit in the least significant bit)
+ * bit in the least significant bit). Returns -1 in case of failure.
  */
 int readPacket( void )
 {
 	int word  = 0;  /* the received word, for return to the caller */
     int irq   = 0;  /* the IRQ number */
     
-	static struct timer_list watchdogTimer;
+    unsigned long timeout = 0;  /* used to store timeout (end in jiffies) */
     
-    /* Schedule our watchdog timer. When this fires it sets the 'watchdog'
-     * flag. The loops below which read the GPIO state also test this flag, so
-     * that they will exit when a timeout occurs.
-     * Without this, a hardware fault could potentially cause an infinite loop.
-     */
-
-    watchdog = 0;
-    setup_timer( &watchdogTimer, watchdogCallback, 0 );
-    mod_timer( &watchdogTimer, jiffies + msecs_to_jiffies(WATCHDOG_TIMEOUT) );
-
     /* Request an IRQ for the sensor GPIO pin, so that we can detect falling
      * edge of each transmitted bit. The interrupt handler will then sample
      * and store each bit.
      */
-
     irq = gpio_to_irq( gpio );
     irqCount = 0;
     irqWord  = 0;
-    if ( request_irq(irq, gpioInterruptHandler, IRQF_TRIGGER_FALLING, "tsic_irq", NULL) ) {
-        del_timer( &watchdogTimer );
+    if ( request_irq(irq, gpioInterruptHandler, IRQF_TRIGGER_FALLING, "tsic_irq", NULL) )
         return -1;
-    }
 
-    /* Wait until the interrupt handler has collected 20 bits, or the watchdog
-     * timer has expired.
+    /* Calculate the end time in jiffies when we should time out */
+    timeout = jiffies + msecs_to_jiffies(WATCHDOG_TIMEOUT);
+
+    /* Sleep until the interrupt handler has collected all TSIC_BITS, or we
+     * have timed out waiting for this to happen.
      */
+    while ( (irqCount < TSIC_BITS) && time_before(jiffies,timeout) ) msleep(1);
 
-    while ( (irqCount < 20) && !watchdog ) msleep(1);
-
-    /* Delete the watchdog timer */
-    del_timer( &watchdogTimer );
-    
     /* Free the interrupt */
 	free_irq( irq, NULL );
+	
+	/* If we didn't receive all the bits, return an error */
+	if ( irqCount < TSIC_BITS ) return -1;
 	
 	/* Copy the data word from the interrupt handler */
 	word = irqWord;
