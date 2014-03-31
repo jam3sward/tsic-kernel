@@ -211,10 +211,6 @@ static ssize_t temp_show(
     /* read the temperature sensor */
     int temperature = readTemperature();
     
-    /* if that failed, have one more attempt */
-    if ( temperature == INVALID_TEMP )
-        temperature = readTemperature();
-    
     /* output the temperature if valid */
     if ( temperature != INVALID_TEMP )
         return sprintf( buffer, "%d\n", temperature );
