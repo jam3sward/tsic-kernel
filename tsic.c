@@ -252,21 +252,9 @@ static ssize_t temp_show(
 
 /*---------------------------------------------------------------------------*/
 
-/* This function is called when the 'temp' kernel object is written */
-static ssize_t temp_store(
-    struct kobject *object,
-    struct kobj_attribute *attribute,
-    const char *buffer, size_t count
-) {
-	return count;
-}
-
-/*---------------------------------------------------------------------------*/
-
 /* Attribute representing the 'temp' kernel object, which is read only */
-static struct kobj_attribute tempAttribute =
-    __ATTR(temp, 0666, temp_show, temp_store);
-    
+static struct kobj_attribute tempAttribute = __ATTR_RO(temp);
+
 /*---------------------------------------------------------------------------*/
 
 /* List of all attributes */
