@@ -60,6 +60,7 @@ static int parity8( int value )
 
 static int irqCount = 0;    /* Number of interrupts received */
 static int irqWord  = 0;    /* The data word, updated by interrupt handler */
+static int irqReset = 0;    /* Request to reset irqCount/irqWord and retry */
 
 static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 {
@@ -73,6 +74,13 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
     
     /* Sample the data line */
     value = gpio_get_value(gpio) & 1;
+    
+    /* We have been asked to start again from bit zero */
+    if ( irqReset ) {
+        irqCount = 0;
+        irqWord  = 0;
+        irqReset = 0;
+    }
     
     /* Store the data bit */
     if (irqCount < TSIC_BITS) irqWord = (irqWord << 1) | value;
@@ -90,9 +98,11 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
  * bit in the least significant bit). Returns -1 in case of failure.
  */
 int readPacket( void )
-{
+{ 
 	int word  = 0;  /* the received word, for return to the caller */
     int irq   = 0;  /* the IRQ number */
+    int old   = 0;  /* used to store old IRQ counter value */
+    int retry = 0;  /* number of retries */
     
     unsigned long timeout = 0;  /* used to store timeout (end in jiffies) */
     
@@ -112,7 +122,29 @@ int readPacket( void )
     /* Sleep until the interrupt handler has collected all TSIC_BITS, or we
      * have timed out waiting for this to happen.
      */
-    while ( (irqCount < TSIC_BITS) && time_before(jiffies,timeout) ) msleep(1);
+    while ( (irqCount < TSIC_BITS) && time_before(jiffies,timeout) ) {
+        /* Sleep for 1ms */
+        msleep(1);
+        
+        /* If we have received at least one bit, and have received no other
+         * bits since the previous time step, we must have run off the end
+         * of a packet (i.e. were called part way through a packet). In this
+         * case, we ask the interrupt handler to reset and try again.
+         */
+        if ( (irqCount > 0) && (irqCount == old) && (irqReset == 0) ) {
+            /* if we haven't exceeded the maximum number of retries */
+            if ( ++retry < 2 ) {
+                /* ask the interrupt handler to retry */
+                ++irqReset;
+            } else {
+                /* give up (this is a precaution against infinite retries) */
+                break;
+            }
+        }
+        
+        /* Remember the number of bits for next time step */
+        old = irqCount;
+    }
 
     /* Free the interrupt */
 	free_irq( irq, NULL );
