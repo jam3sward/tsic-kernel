@@ -58,36 +58,45 @@ static int parity8( int value )
 
 /*---------------------------------------------------------------------------*/
 
-static int irqCount = 0;    /* Number of interrupts received */
-static int irqWord  = 0;    /* The data word, updated by interrupt handler */
-static int irqReset = 0;    /* Request to reset irqCount/irqWord and retry */
+typedef struct {
+	int count;		/* Number of interrupts received */
+	int word;		/* The data word, updated by interrupt handler */
+	int reset;		/* Request to reset irqCount/irqWord and retry */
+} IRQData;
+
+static IRQData irqData;
+
+/*---------------------------------------------------------------------------*/
 
 static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 {
     int value;
-    
+
+	/* Check the cookie */
+	if ( dev_id != &irqData ) return IRQ_HANDLED;
+
     /* Assuming that each bit frame is 125us duration, and logic 1 is 75%
      * duty, and logic 0 is 25% duty, we sample between 31.25us and 93.75us.
      * Here we use 40us, allowing for some tolerance in case of delay.
      */
     udelay(40);
-    
+
     /* Sample the data line */
     value = gpio_get_value(gpio) & 1;
-    
+
     /* We have been asked to start again from bit zero */
-    if ( irqReset ) {
-        irqCount = 0;
-        irqWord  = 0;
-        irqReset = 0;
+    if ( irqData.reset ) {
+        irqData.count = 0;
+        irqData.word  = 0;
+        irqData.reset = 0;
     }
-    
+
     /* Store the data bit */
-    if (irqCount < TSIC_BITS) irqWord = (irqWord << 1) | value;
-    
+    if (irqData.count < TSIC_BITS) irqData.word = (irqData.word << 1) | value;
+
     /* Count the number of interrupts (bits) handled */
-    ++irqCount;
-    
+    ++irqData.count;
+
     return IRQ_HANDLED;
 }
 
@@ -98,22 +107,29 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
  * bit in the least significant bit). Returns -1 in case of failure.
  */
 int readPacket( void )
-{ 
+{
 	int word  = 0;  /* the received word, for return to the caller */
     int irq   = 0;  /* the IRQ number */
     int old   = 0;  /* used to store old IRQ counter value */
     int retry = 0;  /* number of retries */
-    
+
     unsigned long timeout = 0;  /* used to store timeout (end in jiffies) */
-    
+
     /* Request an IRQ for the sensor GPIO pin, so that we can detect falling
      * edge of each transmitted bit. The interrupt handler will then sample
      * and store each bit.
      */
     irq = gpio_to_irq( gpio );
-    irqCount = 0;
-    irqWord  = 0;
-    if ( request_irq(irq, gpioInterruptHandler, IRQF_TRIGGER_FALLING, "tsic_irq", NULL) )
+    irqData.count = 0;
+    irqData.word  = 0;
+	irqData.reset = 0;
+    if ( request_irq(
+		irq,
+		gpioInterruptHandler,
+		IRQF_TRIGGER_FALLING | IRQF_SHARED,
+		"tsic_irq",
+		&irqData				/* Pointer to data structure */
+	) )
         return -1;
 
     /* Calculate the end time in jiffies when we should time out */
@@ -122,44 +138,48 @@ int readPacket( void )
     /* Sleep until the interrupt handler has collected all TSIC_BITS, or we
      * have timed out waiting for this to happen.
      */
-    while ( (irqCount < TSIC_BITS) && time_before(jiffies,timeout) ) {
+    while ( (irqData.count < TSIC_BITS) && time_before(jiffies,timeout) ) {
         /* Sleep for 1ms */
         msleep(1);
-        
+
         /* If we have received at least one bit, and have received no other
          * bits since the previous time step, we must have run off the end
          * of a packet (i.e. were called part way through a packet). In this
          * case, we ask the interrupt handler to reset and try again.
          */
-        if ( (irqCount > 0) && (irqCount == old) && (irqReset == 0) ) {
+        if (
+			(irqData.count >  0)   &&
+			(irqData.count == old) &&
+			(irqData.reset == 0)
+		) {
             /* if we haven't exceeded the maximum number of retries */
             if ( ++retry < 2 ) {
                 /* ask the interrupt handler to retry */
-                ++irqReset;
+                irqData.reset++;
             } else {
                 /* give up (this is a precaution against infinite retries) */
                 break;
             }
         }
-        
+
         /* Remember the number of bits for next time step */
-        old = irqCount;
+        old = irqData.count;
     }
 
     /* Free the interrupt */
-	free_irq( irq, NULL );
-	
+	free_irq( irq, &irqData );
+
 	/* If we didn't receive all the bits, return an error */
-	if ( irqCount < TSIC_BITS ) return -1;
-	
+	if ( irqData.count < TSIC_BITS ) return -1;
+
 	/* Copy the data word from the interrupt handler */
-	word = irqWord;
-	
+	word = irqData.word;
+
 	/* contains: <data><parity><start><data><parity> */
-	
+
 	/* strip out start bit in middle */
 	word = (word & 0x1FF) | ((word >> 1) & (0x1FF << 9));
-	
+
     /*printk( KERN_ALERT "tsic: %X\n", word );*/
 
     /* now contains: <data><parity><data><parity> */
@@ -204,13 +224,13 @@ int readTemperature( void )
 	
 	/* if the parity is wrong, return INVALID_TEMP */
 	if ( !valid ) {
-    	/*printk( KERN_ALERT "tsic: parity error (%03X %03X)\n", packet0, packet1 );*/
+    	printk( KERN_ALERT "tsic: parity error (%03X %03X)\n", packet0, packet1 );
 	    return INVALID_TEMP;
 	}
 	
 	/* if any of the top 5 bits of packet 0 are high, that's an error */
 	if ( (packet0 & 0xF8) != 0 ) {
-	    /*printk( KERN_ALERT "tsic: prefix error (%03X %03X)\n", packet0, packet1 );*/
+	    printk( KERN_ALERT "tsic: prefix error (%03X %03X)\n", packet0, packet1 );
 	    return INVALID_TEMP;
 	}
 
@@ -227,7 +247,7 @@ int readTemperature( void )
 		return temp;
 	} else {
 		/* parity looked good, but the value is out of the valid range */
-		/*printk( KERN_ALERT "tsic: range error (%03X %03X)\n", packet0, packet1 );*/
+		printk( KERN_ALERT "tsic: range error (%03X %03X)\n", packet0, packet1 );
 		return INVALID_TEMP;
 	}
 }
@@ -243,6 +263,10 @@ static ssize_t temp_show(
     /* read the temperature sensor */
     int temperature = readTemperature();
     
+	/* allow one retry in case of failure */
+	if ( temperature == INVALID_TEMP )
+		temperature = readTemperature();
+
     /* output the temperature if valid */
     if ( temperature != INVALID_TEMP )
         return sprintf( buffer, "%d\n", temperature );
