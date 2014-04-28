@@ -72,9 +72,6 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 {
     int value;
 
-	/* Check the cookie */
-	if ( dev_id != &irqData ) return IRQ_HANDLED;
-
     /* Assuming that each bit frame is 125us duration, and logic 1 is 75%
      * duty, and logic 0 is 25% duty, we sample between 31.25us and 93.75us.
      * Here we use 40us, allowing for some tolerance in case of delay.
@@ -83,6 +80,9 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 
     /* Sample the data line */
     value = gpio_get_value(gpio) & 1;
+
+	/* Check the cookie */
+	if ( dev_id != &irqData ) return IRQ_HANDLED;
 
     /* We have been asked to start again from bit zero */
     if ( irqData.reset ) {
@@ -224,7 +224,7 @@ int readTemperature( void )
 	
 	/* if the parity is wrong, return INVALID_TEMP */
 	if ( !valid ) {
-    	printk( KERN_ALERT "tsic: parity error (%03X %03X)\n", packet0, packet1 );
+    	printk( KERN_ALERT "tsic: parity error (%X %03X %03X)\n", raw, packet0, packet1 );
 	    return INVALID_TEMP;
 	}
 	
@@ -264,8 +264,10 @@ static ssize_t temp_show(
     int temperature = readTemperature();
     
 	/* allow one retry in case of failure */
-	if ( temperature == INVALID_TEMP )
+	if ( temperature == INVALID_TEMP ) {
+		msleep(2);
 		temperature = readTemperature();
+	}
 
     /* output the temperature if valid */
     if ( temperature != INVALID_TEMP )
