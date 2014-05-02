@@ -9,7 +9,7 @@ The TSIC 306 is a digital temperature sensor which has an accuracy of +/-0.3K, r
 Here are the relevant data sheets on the sensor:
   * [http://www.farnell.com/datasheets/1643983.pdf TSIC 306 Data Sheet (Farnell)]
   * [http://www.ist-ag.com/eh/ist-ag/resource.nsf/imgref/Download_DTTSic20x_30x_E2.1.pdf/$FILE/DTTSic20x_30x_E2.1.pdf TSIC 306 Data (IST)]
-  * [http://www.ist-ag.com/eh/ist-ag/resource.nsf/imgref/Download_ATTSic_E2.0[smallpdf.com].pdf/$FILE/ATTSic_E2.0[smallpdf.com].pdf Application Note, with communication protocol (IST)]
+  * [http://www.ist-ag.com%2Feh%2Fist-ag%2Fresource.nsf%2Fimgref%2FDownload_ATTSic_E2.0%5Bsmallpdf.com%5D.pdf%2F%24FILE%2FATTSic_E2.0%5Bsmallpdf.com%5D.pdf&ei=i_pjU_fOGIKLOZvqgIgM&usg=AFQjCNHyzO3IMF93Wm4JlQDAFuotR1Z05w&bvm=bv.65788261,d.ZWU Application Note, with communication protocol (IST)]
 
 = Suppliers =
 
