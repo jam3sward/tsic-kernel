@@ -15,6 +15,7 @@
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
 #include <linux/time.h>
+#include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/irq.h>
@@ -45,7 +46,7 @@ static const int MAX_TEMP = 150;
 static const int INVALID_TEMP = -100000;
 
 /* Watchdog timeout period in ms */
-static const int WATCHDOG_TIMEOUT = 110;
+static const int WATCHDOG_TIMEOUT = 150;
 
 /*---------------------------------------------------------------------------*/
 
@@ -61,16 +62,24 @@ static int parity8( int value )
 typedef struct {
 	int count;		/* Number of interrupts received */
 	int word;		/* The data word, updated by interrupt handler */
-	int reset;		/* Request to reset irqCount/irqWord and retry */
+	ktime_t first;  /* Time-stamp of first bit received */
+	ktime_t last;   /* Time-stamp of last bit received */
 } IRQData;
 
 static IRQData irqData;
+
+/* Declare a wait queue to wait for interrupts */
+static DECLARE_WAIT_QUEUE_HEAD(wait);
+
+/* Mutex used to prevent simultaneous access */
+static DEFINE_MUTEX(mutex);
 
 /*---------------------------------------------------------------------------*/
 
 static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 {
     int value;
+    ktime_t now;
 
     /* Assuming that each bit frame is 125us duration, and logic 1 is 75%
      * duty, and logic 0 is 25% duty, we sample between 31.25us and 93.75us.
@@ -84,18 +93,28 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 	/* Check the cookie */
 	if ( dev_id != &irqData ) return IRQ_HANDLED;
 
-    /* We have been asked to start again from bit zero */
-    if ( irqData.reset ) {
-        irqData.count = 0;
-        irqData.word  = 0;
-        irqData.reset = 0;
+    /* Get the current kernel time */
+    now = ktime_get();
+
+    /* Record the time-stamp when the first bit is received */
+    if ( irqData.count == 0 )
+        irqData.first = now;
+
+    /* If we are still collecting bits */
+    if (irqData.count < TSIC_BITS) {
+        /* Record the time-stamp of the last bit */
+        irqData.last = now;
+
+        /* Store the bit in the packet */
+        irqData.word = (irqData.word << 1) | value;
+
+        /* Count the number of interrupts (bits) handled */
+        ++irqData.count;
+
+        /* Wake up when a complete packet has been received */
+        if ( irqData.count == TSIC_BITS )
+            wake_up_interruptible( &wait );
     }
-
-    /* Store the data bit */
-    if (irqData.count < TSIC_BITS) irqData.word = (irqData.word << 1) | value;
-
-    /* Count the number of interrupts (bits) handled */
-    ++irqData.count;
 
     return IRQ_HANDLED;
 }
@@ -110,67 +129,72 @@ int readPacket( void )
 {
 	int word  = 0;  /* the received word, for return to the caller */
     int irq   = 0;  /* the IRQ number */
-    int old   = 0;  /* used to store old IRQ counter value */
-    int retry = 0;  /* number of retries */
+    struct timeval elapsed;
 
-    unsigned long timeout = 0;  /* used to store timeout (end in jiffies) */
+    /* Find the IRQ associated with the GPIO pin */
+    irq = gpio_to_irq( gpio );
+
+    /* Initialise the variables used by the interrupt handler */
+    irqData.count = 0;
+    irqData.word  = 0;
+
+    /* Acquire the mutex before entering critical section */
+    mutex_lock( &mutex );
 
     /* Request an IRQ for the sensor GPIO pin, so that we can detect falling
      * edge of each transmitted bit. The interrupt handler will then sample
      * and store each bit.
      */
-    irq = gpio_to_irq( gpio );
-    irqData.count = 0;
-    irqData.word  = 0;
-	irqData.reset = 0;
     if ( request_irq(
 		irq,
 		gpioInterruptHandler,
 		IRQF_TRIGGER_FALLING | IRQF_SHARED,
 		"tsic_irq",
 		&irqData				/* Pointer to data structure */
-	) )
+    ) ) {
+        printk( KERN_ALERT "tsic: request_irq failed\n" );
         return -1;
-
-    /* Calculate the end time in jiffies when we should time out */
-    timeout = jiffies + msecs_to_jiffies(WATCHDOG_TIMEOUT);
-
-    /* Sleep until the interrupt handler has collected all TSIC_BITS, or we
-     * have timed out waiting for this to happen.
-     */
-    while ( (irqData.count < TSIC_BITS) && time_before(jiffies,timeout) ) {
-        /* Sleep for 1ms */
-        msleep(1);
-
-        /* If we have received at least one bit, and have received no other
-         * bits since the previous time step, we must have run off the end
-         * of a packet (i.e. were called part way through a packet). In this
-         * case, we ask the interrupt handler to reset and try again.
-         */
-        if (
-			(irqData.count >  0)   &&
-			(irqData.count == old) &&
-			(irqData.reset == 0)
-		) {
-            /* if we haven't exceeded the maximum number of retries */
-            if ( ++retry < 2 ) {
-                /* ask the interrupt handler to retry */
-                irqData.reset++;
-            } else {
-                /* give up (this is a precaution against infinite retries) */
-                break;
-            }
-        }
-
-        /* Remember the number of bits for next time step */
-        old = irqData.count;
     }
 
-    /* Free the interrupt */
-	free_irq( irq, &irqData );
+    /* Wait until we have received a complete packet, or timed out */
+    wait_event_interruptible_timeout(
+        wait,
+        irqData.count == TSIC_BITS,
+        msecs_to_jiffies(WATCHDOG_TIMEOUT)
+    );
 
-	/* If we didn't receive all the bits, return an error */
-	if ( irqData.count < TSIC_BITS ) return -1;
+    /* Free the interrupt */
+    free_irq( irq, &irqData );
+
+    /* Release the mutex */
+    mutex_unlock( &mutex );
+
+    /* If we didn't receive all the bits, return an error */
+    if ( irqData.count < TSIC_BITS ) {
+        printk( KERN_ALERT "tsic: timed out on receive\n" );
+        return -1;
+    }
+
+    /* Calculate the elapsed time to receive the whole packet. This
+     * should be about 125us x 20 bits = 2500us. Actually there are two
+     * 10 bit words with 1 stop bit in between, and we sample the time
+     * inside the first and last received bit. In testing over 100
+     * samples, it ranged between 2574us and 2614us.
+     */
+    elapsed = ktime_to_timeval(
+        ktime_sub( irqData.last, irqData.first )
+    );
+
+    /*printk( KERN_ALERT "tsic: %ldus\n", elapsed.tv_usec );*/
+
+    /* If the packet took more than 3000us to read, it probably indicates
+     * that we read off the end of one packet and started reading another,
+     * which will result in corrupt data (we will need to retry).
+     */
+    if ( elapsed.tv_usec > 3000 ) {
+        printk( KERN_ALERT "tsic: read off the end of a packet\n" );
+        return -1;
+    }
 
 	/* Copy the data word from the interrupt handler */
 	word = irqData.word;
@@ -262,12 +286,14 @@ static ssize_t temp_show(
 ) {
     /* read the temperature sensor */
     int temperature = readTemperature();
-    
-	/* allow one retry in case of failure */
-	if ( temperature == INVALID_TEMP ) {
-		msleep(2);
-		temperature = readTemperature();
-	}
+
+    /* allow one retry in case of failure */
+    if ( temperature == INVALID_TEMP ) {
+        /* sleep in case we are still in the middle of a packet */
+        msleep(3);
+        /* try again */
+        temperature = readTemperature();
+    }
 
     /* output the temperature if valid */
     if ( temperature != INVALID_TEMP )
