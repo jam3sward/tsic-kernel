@@ -134,12 +134,12 @@ int readPacket( void )
     /* Find the IRQ associated with the GPIO pin */
     irq = gpio_to_irq( gpio );
 
+    /* Acquire the mutex before entering critical section */
+    mutex_lock( &mutex );
+
     /* Initialise the variables used by the interrupt handler */
     irqData.count = 0;
     irqData.word  = 0;
-
-    /* Acquire the mutex before entering critical section */
-    mutex_lock( &mutex );
 
     /* Request an IRQ for the sensor GPIO pin, so that we can detect falling
      * edge of each transmitted bit. The interrupt handler will then sample
