@@ -46,7 +46,7 @@ static const int MAX_TEMP = 150;
 static const int INVALID_TEMP = -100000;
 
 /* Watchdog timeout period in ms */
-static const int WATCHDOG_TIMEOUT = 150;
+static const int WATCHDOG_TIMEOUT = 200;
 
 /*---------------------------------------------------------------------------*/
 
@@ -80,6 +80,7 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
 {
     int value;
     ktime_t now;
+    s64 ns;
 
     /* Assuming that each bit frame is 125us duration, and logic 1 is 75%
      * duty, and logic 0 is 25% duty, we sample between 31.25us and 93.75us.
@@ -97,11 +98,25 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
     now = ktime_get();
 
     /* Record the time-stamp when the first bit is received */
-    if ( irqData.count == 0 )
+    if ( irqData.count == 0 ) {
         irqData.first = now;
+        irqData.last  = now;
+    }
 
     /* If we are still collecting bits */
     if (irqData.count < TSIC_BITS) {
+        /* Calculate bit time */
+        ns = ktime_to_ns(
+            ktime_sub( now, irqData.last )
+        );
+
+        /* If more than 300us has elapsed between bits, restart new packet */
+        if ( ns > 300000 ) {
+            irqData.first = now;
+            irqData.word  = 0;
+            irqData.count = 0;
+        }
+
         /* Record the time-stamp of the last bit */
         irqData.last = now;
 
@@ -127,9 +142,10 @@ static irqreturn_t gpioInterruptHandler( int irq, void *dev_id )
  */
 int readPacket( void )
 {
-	int word  = 0;  /* the received word, for return to the caller */
-    int irq   = 0;  /* the IRQ number */
-    struct timeval elapsed;
+    int word  = 0;          /* the received word, for return to the caller */
+    int irq   = 0;          /* the IRQ number */
+    struct timeval elapsed; /* the elapsed time for the packet */
+    int fullPacket = 0;     /* has a complete packet been received? */
 
     /* Find the IRQ associated with the GPIO pin */
     irq = gpio_to_irq( gpio );
@@ -152,6 +168,10 @@ int readPacket( void )
 		"tsic_irq",
 		&irqData				/* Pointer to data structure */
     ) ) {
+        /* Release the mutex */
+        mutex_unlock( &mutex );
+
+        /* Report that we failed to acquire the IRQ */
         printk( KERN_ALERT "tsic: request_irq failed\n" );
         return -1;
     }
@@ -166,15 +186,6 @@ int readPacket( void )
     /* Free the interrupt */
     free_irq( irq, &irqData );
 
-    /* Release the mutex */
-    mutex_unlock( &mutex );
-
-    /* If we didn't receive all the bits, return an error */
-    if ( irqData.count < TSIC_BITS ) {
-        printk( KERN_ALERT "tsic: timed out on receive\n" );
-        return -1;
-    }
-
     /* Calculate the elapsed time to receive the whole packet. This
      * should be about 125us x 20 bits = 2500us. Actually there are two
      * 10 bit words with 1 stop bit in between, and we sample the time
@@ -185,26 +196,27 @@ int readPacket( void )
         ktime_sub( irqData.last, irqData.first )
     );
 
-    /*printk( KERN_ALERT "tsic: %ldus\n", elapsed.tv_usec );*/
-
-    /* If the packet took more than 3000us to read, it probably indicates
-     * that we read off the end of one packet and started reading another,
-     * which will result in corrupt data (we will need to retry).
-     */
-    if ( elapsed.tv_usec > 3000 ) {
-        printk( KERN_ALERT "tsic: read off the end of a packet\n" );
-        return -1;
-    }
-
 	/* Copy the data word from the interrupt handler */
 	word = irqData.word;
 
-	/* contains: <data><parity><start><data><parity> */
+    /* Have we received a full packet? */
+    fullPacket = (irqData.count == TSIC_BITS);
+
+    /* Release the mutex */
+    mutex_unlock( &mutex );
+
+    /* Not safe to use any IRQ data after this point */
+
+    /* If we didn't receive all the bits, return an error */
+    if ( !fullPacket ) {
+        printk( KERN_ALERT "tsic: incomplete packet / timed out\n" );
+        return -1;
+    }
+
+	/* data word contains: <data><parity><start><data><parity> */
 
 	/* strip out start bit in middle */
 	word = (word & 0x1FF) | ((word >> 1) & (0x1FF << 9));
-
-    /*printk( KERN_ALERT "tsic: %X\n", word );*/
 
     /* now contains: <data><parity><data><parity> */
 
